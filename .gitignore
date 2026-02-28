@@ -1,0 +1,7 @@
+target/
+*.class
+*.log
+TestApp.java
+mcp_test.py
+TestJdi.java
+dependency-reduced-pom.xml
