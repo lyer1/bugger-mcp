@@ -6,11 +6,19 @@ import com.sun.jdi.event.*;
 import com.sun.jdi.request.*;
 
 import java.util.*;
+import java.util.LinkedHashMap;
 
 public class JdiDebugger {
     private VirtualMachine vm;
 
     public Map<String, Object> attach(String host, int port) throws Exception {
+        if (vm != null) {
+            try { vm.version(); } catch (Exception e) {
+                // Stale connection — clean up and re-attach
+                try { vm.dispose(); } catch (Exception ignored) {}
+                vm = null;
+            }
+        }
         if (vm != null) return Map.of("status", "already_attached");
         VirtualMachineManager vmm = Bootstrap.virtualMachineManager();
         AttachingConnector connector = null;
@@ -34,7 +42,7 @@ public class JdiDebugger {
 
     public Map<String, Object> disconnect() {
         if (vm != null) {
-            vm.dispose();
+            try { vm.dispose(); } catch (Exception ignored) {}
             vm = null;
             return Map.of("status", "disconnected");
         }
@@ -201,6 +209,165 @@ public class JdiDebugger {
         req.enable();
         vm.resume();
         return Map.of("status", "stepping");
+    }
+
+    public Map<String, Object> inspectVariable(long threadId, int frameIndex, String variableName, int maxDepth) throws Exception {
+        if (vm == null) return Map.of("error", "Not attached");
+        ThreadReference thread = null;
+        for (ThreadReference t : vm.allThreads()) {
+            if (t.uniqueID() == threadId) {
+                thread = t;
+                break;
+            }
+        }
+        if (thread == null) return Map.of("error", "Thread not found");
+        if (!thread.isSuspended()) return Map.of("error", "Thread is not suspended");
+
+        List<StackFrame> frames = thread.frames();
+        if (frameIndex < 0 || frameIndex >= frames.size()) {
+            return Map.of("error", "Frame index out of range (0-" + (frames.size() - 1) + ")");
+        }
+
+        StackFrame frame = frames.get(frameIndex);
+        LocalVariable var;
+        try {
+            var = frame.visibleVariableByName(variableName);
+        } catch (AbsentInformationException e) {
+            return Map.of("error", "Local variable information not available for this frame");
+        }
+        if (var == null) {
+            return Map.of("error", "Variable '" + variableName + "' not found in frame");
+        }
+
+        Value val = frame.getValue(var);
+        Object expanded = expandValue(val, maxDepth, 0);
+        Map<String, Object> result = new HashMap<>();
+        result.put("variable", variableName);
+        result.put("type", var.typeName());
+        result.put("value", expanded);
+        return result;
+    }
+
+    private Object expandValue(Value val, int maxDepth, int currentDepth) {
+        if (val == null) return null;
+
+        if (val instanceof StringReference) {
+            return ((StringReference) val).value();
+        }
+        if (val instanceof BooleanValue) {
+            return ((BooleanValue) val).value();
+        }
+        if (val instanceof ByteValue) {
+            return ((ByteValue) val).value();
+        }
+        if (val instanceof CharValue) {
+            return String.valueOf(((CharValue) val).value());
+        }
+        if (val instanceof ShortValue) {
+            return ((ShortValue) val).value();
+        }
+        if (val instanceof IntegerValue) {
+            return ((IntegerValue) val).value();
+        }
+        if (val instanceof LongValue) {
+            return ((LongValue) val).value();
+        }
+        if (val instanceof FloatValue) {
+            return ((FloatValue) val).value();
+        }
+        if (val instanceof DoubleValue) {
+            return ((DoubleValue) val).value();
+        }
+
+        if (val instanceof ArrayReference) {
+            ArrayReference arr = (ArrayReference) val;
+            List<Object> items = new ArrayList<>();
+            int len = Math.min(arr.length(), 100); // cap at 100 elements
+            for (int i = 0; i < len; i++) {
+                if (currentDepth < maxDepth) {
+                    items.add(expandValue(arr.getValue(i), maxDepth, currentDepth + 1));
+                } else {
+                    Value elem = arr.getValue(i);
+                    items.add(elem == null ? null : elem.toString());
+                }
+            }
+            if (arr.length() > 100) items.add("... (" + arr.length() + " total elements)");
+            return items;
+        }
+
+        if (val instanceof ObjectReference) {
+            ObjectReference obj = (ObjectReference) val;
+
+            // For common wrapper types and enums, use toString via invokeMethod
+            String typeName = obj.referenceType().name();
+            if (typeName.startsWith("java.lang.") || typeName.equals("java.math.BigDecimal") || typeName.equals("java.math.BigInteger")) {
+                try {
+                    return invokeToString(obj);
+                } catch (Exception e) {
+                    return obj.toString();
+                }
+            }
+
+            // For enums, get the name
+            if (obj.referenceType() instanceof com.sun.jdi.ClassType) {
+                com.sun.jdi.ClassType ct = (com.sun.jdi.ClassType) obj.referenceType();
+                if (ct.superclass() != null && ct.superclass().name().equals("java.lang.Enum")) {
+                    try {
+                        Field nameField = ct.fieldByName("name");
+                        if (nameField != null) {
+                            Value nameVal = obj.getValue(nameField);
+                            if (nameVal instanceof StringReference) {
+                                return ((StringReference) nameVal).value();
+                            }
+                        }
+                    } catch (Exception e) {
+                        // fall through
+                    }
+                    return obj.toString();
+                }
+            }
+
+            if (currentDepth >= maxDepth) {
+                return obj.referenceType().name() + " (id=" + obj.uniqueID() + ")";
+            }
+
+            // Expand object fields
+            Map<String, Object> fieldMap = new LinkedHashMap<>();
+            fieldMap.put("__type__", obj.referenceType().name());
+            ReferenceType refType = obj.referenceType();
+            List<Field> fields = refType.allFields();
+            for (Field f : fields) {
+                if (f.isStatic()) continue; // skip static fields
+                try {
+                    Value fieldVal = obj.getValue(f);
+                    fieldMap.put(f.name(), expandValue(fieldVal, maxDepth, currentDepth + 1));
+                } catch (Exception e) {
+                    fieldMap.put(f.name(), "<error: " + e.getMessage() + ">");
+                }
+            }
+            return fieldMap;
+        }
+
+        return val.toString();
+    }
+
+    private String invokeToString(ObjectReference obj) throws Exception {
+        List<Method> methods = obj.referenceType().methodsByName("toString", "()Ljava/lang/String;");
+        if (methods.isEmpty()) return obj.toString();
+        // Find a thread we can use for invocation
+        ThreadReference invThread = null;
+        for (ThreadReference t : vm.allThreads()) {
+            if (t.isSuspended() && t.frameCount() > 0) {
+                invThread = t;
+                break;
+            }
+        }
+        if (invThread == null) return obj.toString();
+        Value result = obj.invokeMethod(invThread, methods.get(0), Collections.emptyList(), ObjectReference.INVOKE_SINGLE_THREADED);
+        if (result instanceof StringReference) {
+            return ((StringReference) result).value();
+        }
+        return obj.toString();
     }
 
     public boolean isAttached() {

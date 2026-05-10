@@ -23,32 +23,19 @@ public class McpServer {
     }
 
     public void run() {
-        new Thread(this::loop, "mcp-loop").start();
+        loop();
     }
 
     private void loop() {
         try {
-            ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            byte[] tmp = new byte[8192];
-            while (true) {
-                int r = in.read(tmp);
-                if (r < 0) break;
-                buf.write(tmp, 0, r);
-                byte[] all = buf.toByteArray();
-                int idx;
-                while ((idx = indexOf(all, "\r\n\r\n".getBytes(StandardCharsets.UTF_8))) >= 0) {
-                    String header = new String(Arrays.copyOfRange(all, 0, idx), StandardCharsets.UTF_8);
-                    int contentLength = parseContentLength(header);
-                    int start = idx + 4;
-                    if (all.length - start < contentLength) break;
-                    String body = new String(Arrays.copyOfRange(all, start, start + contentLength), StandardCharsets.UTF_8);
-                    Map<String,Object> req = Json.readObj(body);
-                    Map<String,Object> resp = handle(req);
-                    write(resp);
-                    all = Arrays.copyOfRange(all, start + contentLength, all.length);
-                }
-                buf.reset();
-                buf.write(all);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                Map<String,Object> req = Json.readObj(line);
+                Map<String,Object> resp = handle(req);
+                write(resp);
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -84,7 +71,7 @@ public class McpServer {
                 return respOk(id, Map.of("ok", true));
             } else if ("initialize".equals(method)) {
                 return respOk(id, Map.of(
-                    "protocolVersion", "2024-11-05",
+                    "protocolVersion", "2025-06-18",
                     "serverInfo", Map.of("name", "jvm-debugger-mcp", "version", "1.0"),
                     "capabilities", Map.of("tools", Map.of())
                 ));
@@ -118,25 +105,8 @@ public class McpServer {
     private synchronized void write(Map<String,Object> msg) throws Exception {
         if (msg == null) return;
         byte[] body = Json.writeBytes(msg);
-        String h = "Content-Length: " + body.length + "\r\n\r\n";
-        out.write(h.getBytes(StandardCharsets.UTF_8));
         out.write(body);
+        out.write('\n');
         out.flush();
-    }
-
-    private int indexOf(byte[] a, byte[] b) {
-        outer: for (int i=0;i<=a.length-b.length;i++) {
-            for (int j=0;j<b.length;j++) if (a[i+j]!=b[j]) continue outer;
-            return i;
-        }
-        return -1;
-    }
-
-    private int parseContentLength(String header) {
-        for (String line : header.split("\r\n")) {
-            int i = line.toLowerCase().indexOf("content-length:");
-            if (i==0) return Integer.parseInt(line.substring(15).trim());
-        }
-        return 0;
     }
 }

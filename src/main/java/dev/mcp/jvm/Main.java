@@ -148,6 +148,30 @@ public class Main {
             }
         });
 
+        tools.add(new McpServer.Tool() {
+            public String name() { return "jvm_inspect"; }
+            public String description() { return "Inspect a local variable in a suspended thread's stack frame, expanding object fields recursively (like IntelliJ's debugger). Returns all field names and values."; }
+            public Map<String, Object> schema() {
+                return Map.of(
+                    "type", "object",
+                    "properties", Map.of(
+                        "threadId", Map.of("type", "integer", "description", "The unique ID of the suspended thread."),
+                        "frameIndex", Map.of("type", "integer", "description", "Stack frame index (0 = top frame). Default: 0."),
+                        "variableName", Map.of("type", "string", "description", "Name of the local variable to inspect."),
+                        "maxDepth", Map.of("type", "integer", "description", "Max depth to expand nested objects. Default: 3.")
+                    ),
+                    "required", List.of("threadId", "variableName")
+                );
+            }
+            public Map<String, Object> call(Map<String, Object> args) throws Exception {
+                long threadId = ((Number) args.get("threadId")).longValue();
+                int frameIndex = args.containsKey("frameIndex") ? ((Number) args.get("frameIndex")).intValue() : 0;
+                String variableName = String.valueOf(args.get("variableName"));
+                int maxDepth = args.containsKey("maxDepth") ? ((Number) args.get("maxDepth")).intValue() : 3;
+                return debugger.inspectVariable(threadId, frameIndex, variableName, maxDepth);
+            }
+        });
+
         McpServer server = new McpServer(tools, System.in, System.out);
         server.run();
     }
